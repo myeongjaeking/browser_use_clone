@@ -1,189 +1,177 @@
 """
-SPLX-detectable: Optimized Agents SDK + LangGraph (single file)
-- Agents: OpenAI Agents SDK `agents.Agent` (consolidated)
-- Tools: `@function_tool`
-- MCP Servers: `MCPServerStdio` at module scope
-- LangGraph: Simplified nodes (4 Agents)
+SPLX-detectable: Orchestrator-Driven Agent Selection
+- Orchestrator decides which sub-agent to call
 """
 
 import os
 import asyncio
-from typing import TypedDict, Literal, Dict, Any, Optional
-
+from typing import TypedDict, Literal, Dict, Any, Optional, Annotated
 from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages
 
 # OpenAI Agents SDK
 from agents import Agent, Runner, function_tool
 from agents.mcp.server import MCPServerStdio, MCPServerStdioParams
 
 # =========================================================
-# 1) Tools (unchanged)
+# 1) Tools
 # =========================================================
 @function_tool
-def people_lookup(name: str) -> str:
-    """Lookup internal employee info."""
-    return "<TODO: people_lookup result>"
-
+def people_lookup(name: str) -> str: return "<TODO: people result>"
 @function_tool
-def asset_lookup(item: str) -> str:
-    """Lookup asset/location info."""
-    return "<TODO: asset_lookup result>"
-
+def asset_lookup(item: str) -> str: return "<TODO: asset result>"
 @function_tool
-def faq_search(query: str) -> str:
-    """FAQ search."""
-    return "<TODO: faq_search result>"
-
+def faq_search(query: str) -> str: return "<TODO: FAQ result>"
 @function_tool
-def rag_retrieve(query: str) -> str:
-    """RAG retrieve."""
-    return "<TODO: rag_retrieve result>"
+def rag_retrieve(query: str) -> str: return "<TODO: RAG result>"
 
 # =========================================================
-# 2) MCP Server (unchanged)
+# 2) MCP Server
 # =========================================================
 ATLASSIAN_MCP_PARAMS: MCPServerStdioParams = {
-    "command": "uvx",
-    "args": ["mcp-atlassian"],
-    "env": {
-        "JIRA_URL": os.getenv("JIRA_URL", ""),
-        "JIRA_API_TOKEN": os.getenv("JIRA_API_TOKEN", ""),
-        "CONFLUENCE_URL": os.getenv("CONFLUENCE_URL", ""),
-        "CONFLUENCE_API_TOKEN": os.getenv("CONFLUENCE_API_TOKEN", ""),
-    },
+    "command": "uvx", "args": ["mcp-atlassian"],
+    "env": {"JIRA_URL": os.getenv("JIRA_URL", ""), "JIRA_API_TOKEN": os.getenv("JIRA_API_TOKEN", ""),
+            "CONFLUENCE_URL": os.getenv("CONFLUENCE_URL", ""), "CONFLUENCE_API_TOKEN": os.getenv("CONFLUENCE_API_TOKEN", "")},
 }
 ATLASSIAN_MCP_SERVER = MCPServerStdio(ATLASSIAN_MCP_PARAMS)
 
 # =========================================================
-# 3) Consolidated Agents (7→4)
+# 3) 하위 Agents (Orchestrator가 호출)
 # =========================================================
 knowledge_agent = Agent(
     name="Knowledge Agent",
-    instructions="""
-    사내 조회 쿼리에 맞춰 적합한 도구 사용:
-    - people_lookup: 사원/팀 정보 (e.g. "김팀장")
-    - asset_lookup: 자산/위치 (e.g. "노트북 위치")
-    - faq_search: FAQ/절차 (e.g. "회식비")
-    """,
+    instructions="사원/자산/FAQ 전문.",
     tools=[people_lookup, asset_lookup, faq_search],
 )
 
-rag_agent = Agent(  # Unchanged
+rag_agent = Agent(
     name="RAG Agent",
-    instructions="문서 기반 질문에 rag_retrieve 사용.",
+    instructions="문서 검색.",
     tools=[rag_retrieve],
 )
 
 action_agent = Agent(
     name="Action Agent",
-    instructions="Jira/Confluence 작업 draft 생성 (JSON 구조). 실행 안 함.",
+    instructions="Jira/Confluence 작업 draft 생성.",
 )
 
 guardrail_agent = Agent(
     name="Guardrail Agent",
-    instructions="Draft 검토 후 allow/deny 결정.",
+    instructions="작업 승인/거부 결정.",
 )
 
 mcp_executor_agent = Agent(
     name="MCP Executor Agent",
-    instructions="승인된 draft를 MCP로 실행.",
+    instructions="MCP로 작업 실행.",
     mcp_servers=[ATLASSIAN_MCP_SERVER],
 )
 
 # =========================================================
-# 4) State (unchanged)
+# 4) Agent-as-Tool (Orchestrator용)
+# =========================================================
+@function_tool
+async def call_knowledge(query: str) -> str:
+    res = await Runner.run(knowledge_agent, query)
+    return res.final_output or "Knowledge 실패"
+
+@function_tool
+async def call_rag(query: str) -> str:
+    res = await Runner.run(rag_agent, query)
+    return res.final_output or "RAG 실패"
+
+@function_tool
+async def call_action(query: str) -> str:
+    res = await Runner.run(action_agent, query)
+    return f"Draft: {res.final_output}"  # 구조화 반환
+
+@function_tool
+async def call_guardrail(draft: str) -> str:
+    res = await Runner.run(guardrail_agent, f"Review: {draft}")
+    return "approved" if "승인" in res.final_output.lower() else "denied"
+
+@function_tool
+async def call_mcp(command: str) -> str:
+    res = await Runner.run(mcp_executor_agent, command)
+    return res.final_output or "MCP 실패"
+
+# =========================================================
+# 5) Orchestrator Agent (결정자)
+# =========================================================
+orchestrator_agent = Agent(
+    name="Orchestrator Agent",
+    instructions="""
+    쿼리 분석 후 적절한 Agent 시퀀스 결정/실행:
+    1. 조회: call_knowledge (사원/FAQ/자산), call_rag (문서)
+    2. 작업: call_action → call_guardrail → call_mcp (Jira/Confluence)
+    
+    힌트 참고: {route}. 여러 호출 순차/병렬 가능. 최종 결과 합성.
+    예: "회식비" → call_knowledge, "티켓 생성" → action→guard→mcp
+    """,
+    tools=[call_knowledge, call_rag, call_action, call_guardrail, call_mcp],
+)
+
+# =========================================================
+# 6) State
 # =========================================================
 class State(TypedDict, total=False):
+    messages: Annotated[list, add_messages]
     user_input: str
     route: Literal["knowledge", "rag", "action"]
-    draft: Dict[str, Any]
-    approved: bool
     result: str
 
 # =========================================================
-# 5) Simplified Nodes
+# 7) Nodes
 # =========================================================
-async def triage_node(state: State) -> State:  # LLM 없이 키워드 룰 (안정/빠름)
+async def triage_hint_node(state: State) -> State:
+    """경량 힌트 생성 (Orchestrator 보조)."""
     query = state["user_input"].lower()
-    if any(word in query for word in ["사원", "팀장", "인사", "이름"]):
+    if any(kw in query for kw in ["사원", "팀", "자산", "faq", "절차", "회식"]):
         state["route"] = "knowledge"
-    elif any(word in query for word in ["자산", "위치", "노트북", "회의실"]):
-        state["route"] = "knowledge"
-    elif any(word in query for word in ["faq", "절차", "회식", "휴가"]):
-        state["route"] = "knowledge"
-    elif any(word in query for word in ["문서", "파일", "보고서"]):
+    elif any(kw in query for kw in ["문서", "보고서"]):
         state["route"] = "rag"
     else:
         state["route"] = "action"
+    print(f"💡 Hint route: {state['route']}")
     return state
 
-async def knowledge_node(state: State) -> State:
-    res = await Runner.run(knowledge_agent, state["user_input"])
+async def orchestrator_node(state: State) -> State:
+    """Orchestrator가 모든 결정/호출."""
+    hint = f"Hint route: {state['route']}. User: {state['user_input']}"
+    print("🤖 Orchestrator deciding...")
+    res = await Runner.run(orchestrator_agent, hint)
     state["result"] = res.final_output
+    print(f"✅ Orchestrator result: {state['result'][:100]}...")
     return state
-
-async def rag_node(state: State) -> State:
-    res = await Runner.run(rag_agent, state["user_input"])
-    state["result"] = res.final_output
-    return state
-
-async def action_node(state: State) -> State:
-    _ = await Runner.run(action_agent, state["user_input"])
-    state["draft"] = {"type": "jira", "payload": {"summary": "<TODO>", "description": "<TODO>"}}
-    state["approved"] = False
-    state["result"] = "Draft 생성. 승인 대기."
-    return state
-
-async def guardrail_node(state: State) -> State:
-    _ = await Runner.run(guardrail_agent, f"Review draft: {state['draft']}")
-    state["approved"] = True  # TODO: 실제 결정 로직
-    return state
-
-async def mcp_execute_node(state: State) -> State:
-    if not state.get("approved", False):
-        state["result"] = "승인 필요. 실행 스킵."
-        return state
-    res = await Runner.run(mcp_executor_agent, f"Execute: {state['draft']}")
-    state["result"] = res.final_output
-    return state
-
-def route_after_triage(state: State) -> str:
-    return state.get("route", "knowledge")
 
 # =========================================================
-# 6) Build Graph
+# 8) Graph (Hint → Orchestrator)
 # =========================================================
 def build_graph():
     g = StateGraph(State)
-    
-    g.add_node("triage", triage_node)
-    g.add_node("knowledge", knowledge_node)
-    g.add_node("rag", rag_node)
-    g.add_node("action", action_node)
-    g.add_node("guardrail", guardrail_node)
-    g.add_node("mcp_execute", mcp_execute_node)
-    
-    g.set_entry_point("triage")
-    g.add_conditional_edges("triage", route_after_triage, {
-        "knowledge": "knowledge",
-        "rag": "rag",
-        "action": "action",
-    })
-    g.add_edge("knowledge", END)
-    g.add_edge("rag", END)
-    g.add_edge("action", "guardrail")
-    g.add_edge("guardrail", "mcp_execute")
-    g.add_edge("mcp_execute", END)
-    
+    g.add_node("triage_hint", triage_hint_node)
+    g.add_node("orchestrator", orchestrator_node)
+    g.set_entry_point("triage_hint")
+    g.add_edge("triage_hint", "orchestrator")
+    g.add_edge("orchestrator", END)
     return g.compile()
 
 # =========================================================
-# 7) Runner
+# 9) Runner + Test
 # =========================================================
 async def main():
     app = build_graph()
-    out = await app.ainvoke({"user_input": "회식비 처리 절차 알려줘"})
-    print(out.get("result", ""))
+    tests = [
+        "회식비 처리 절차 알려줘",
+        "김팀장 어디 있어?",
+        "Q1 보고서 내용 요약",
+        "Jira 티켓 '버그 수정' 생성해"
+    ]
+    
+    for test_input in tests:
+        print(f"\n{'='*60}")
+        print(f"🧪 INPUT: {test_input}")
+        out = await app.ainvoke({"user_input": test_input, "messages": [{"role": "user", "content": test_input}]})
+        print(f"📤 OUTPUT: {out['result']}")
 
 if __name__ == "__main__":
     asyncio.run(main())
