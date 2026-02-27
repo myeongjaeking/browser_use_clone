@@ -1,175 +1,198 @@
 """
-SPLX-recognizable skeleton (single file)
+SPLX-detectable: Agents SDK + LangGraph (single file)
+- Agents: OpenAI Agents SDK `agents.Agent`
+- Tools: `@function_tool`
+- MCP Servers: `MCPServerStdio` at module scope
+- LangGraph: connects agent-level nodes
 
-Targets:
-- Tools detected via: langchain_core.tools.tool
-- Agents detected via: langgraph.prebuilt.create_react_agent
-- MCP Servers detected via: langchain_mcp_adapters.client.MultiServerMCPClient (module-scope)
-- LangGraph connects agent-level nodes
+Business logic intentionally omitted (TODO placeholders).
 """
 
 import os
 import asyncio
-from typing import TypedDict, Literal, Dict, Any, List, Optional
-
-from langchain_openai import ChatOpenAI
-from langchain_core.tools import tool
+from typing import TypedDict, Literal, Dict, Any, Optional
 
 from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import create_react_agent
 
-from langchain_mcp_adapters.client import MultiServerMCPClient
-
-
-# =========================================================
-# LLM
-# =========================================================
-
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0)
+# OpenAI Agents SDK (these are the key symbols SPLX is likely counting)
+from agents import Agent, Runner, function_tool
+from agents.mcp.server import MCPServerStdio, MCPServerStdioParams
 
 
 # =========================================================
-# Local Tools (deterministic placeholders)
+# 1) Tools (Agents SDK style)
 # =========================================================
 
-@tool
+@function_tool
 def people_lookup(name: str) -> str:
-    """Lookup internal employee info from directory/HR."""
+    """Lookup internal employee info (deterministic)."""
     return "<TODO: people_lookup result>"
 
 
-@tool
+@function_tool
 def asset_lookup(item: str) -> str:
-    """Lookup asset/location info from asset DB."""
+    """Lookup asset/location info (deterministic)."""
     return "<TODO: asset_lookup result>"
 
 
-@tool
+@function_tool
 def faq_search(query: str) -> str:
-    """Search FAQ (vector/keyword)."""
+    """FAQ search (vector/keyword)."""
     return "<TODO: faq_search result>"
 
 
-@tool
+@function_tool
 def rag_retrieve(query: str) -> str:
-    """Retrieve documents from vector DB (Confluence/Jira index)."""
+    """RAG retrieve from vector index."""
     return "<TODO: rag_retrieve result>"
 
 
 # =========================================================
-# MCP (declare config + client at module scope)
+# 2) MCP Server (module-scope, SPLX-friendly)
 # =========================================================
 
-ATLASSIAN_MCP_SERVER_CONFIG: Dict[str, Any] = {
-    "atlassian": {
-        "transport": "stdio",
-        "command": "uvx",
-        "args": ["mcp-atlassian"],
-        "env": {
-            "JIRA_URL": os.getenv("JIRA_URL", ""),
-            "JIRA_API_TOKEN": os.getenv("JIRA_API_TOKEN", ""),
-            "CONFLUENCE_URL": os.getenv("CONFLUENCE_URL", ""),
-            "CONFLUENCE_API_TOKEN": os.getenv("CONFLUENCE_API_TOKEN", ""),
-        },
-    }
+ATLASSIAN_MCP_PARAMS: MCPServerStdioParams = {
+    "command": "uvx",
+    "args": ["mcp-atlassian"],
+    "env": {
+        "JIRA_URL": os.getenv("JIRA_URL", ""),
+        "JIRA_API_TOKEN": os.getenv("JIRA_API_TOKEN", ""),
+        "CONFLUENCE_URL": os.getenv("CONFLUENCE_URL", ""),
+        "CONFLUENCE_API_TOKEN": os.getenv("CONFLUENCE_API_TOKEN", ""),
+    },
 }
 
-mcp_client = MultiServerMCPClient(ATLASSIAN_MCP_SERVER_CONFIG)
-mcp_tools: List[Any] = []
-
-mcp_exec_agent: Optional[Any] = None
-
-
-async def init_mcp() -> None:
-    """Load MCP tools at runtime (client stays module-scope for scanners)."""
-    global mcp_tools, mcp_exec_agent
-    mcp_tools = await mcp_client.get_tools()
-    mcp_exec_agent = create_react_agent(llm, tools=mcp_tools)
+# Create the MCP server object at import time (static analyzers like this)
+ATLASSIAN_MCP_SERVER = MCPServerStdio(ATLASSIAN_MCP_PARAMS)
 
 
 # =========================================================
-# Explicit Agents (module-scope)
+# 3) Agents (module-scope, SPLX-friendly)
 # =========================================================
 
-people_agent = create_react_agent(llm, tools=[people_lookup])
-asset_agent = create_react_agent(llm, tools=[asset_lookup])
-faq_agent = create_react_agent(llm, tools=[faq_search])
-rag_agent = create_react_agent(llm, tools=[rag_retrieve])
+# Read agents
+people_agent = Agent(
+    name="People Agent",
+    instructions="You answer questions about employees/teams using the people_lookup tool.",
+    tools=[people_lookup],
+)
 
-action_agent = create_react_agent(llm, tools=[])
-guardrail_agent = create_react_agent(llm, tools=[])
+asset_agent = Agent(
+    name="Asset Agent",
+    instructions="You answer questions about office assets/locations using the asset_lookup tool.",
+    tools=[asset_lookup],
+)
+
+faq_agent = Agent(
+    name="FAQ Agent",
+    instructions="You answer questions using the faq_search tool.",
+    tools=[faq_search],
+)
+
+rag_agent = Agent(
+    name="RAG Agent",
+    instructions="You answer questions grounded in documents using rag_retrieve.",
+    tools=[rag_retrieve],
+)
+
+# Action agent (draft only)
+action_agent = Agent(
+    name="Action Agent",
+    instructions="You create structured drafts for Jira/Confluence actions. Do not execute.",
+)
+
+# Guardrail agent (review)
+guardrail_agent = Agent(
+    name="Guardrail Agent",
+    instructions="You review drafts for policy/permission/risk and decide if execution is allowed.",
+)
+
+# MCP execution agent (the one that can call MCP-provided tools)
+# Keep it explicit: mcp_servers set at definition time
+mcp_executor_agent = Agent(
+    name="MCP Executor Agent",
+    instructions="You execute approved drafts by calling MCP tools on the Atlassian MCP server.",
+    mcp_servers=[ATLASSIAN_MCP_SERVER],
+)
+
+
+# Triage agent (routes)
+triage_agent = Agent(
+    name="Triage Agent",
+    instructions=(
+        "Classify the user's request into one of: people, asset, faq, rag, action. "
+        "Return ONLY the route label."
+    ),
+)
 
 
 # =========================================================
-# LangGraph State
+# 4) LangGraph State
 # =========================================================
 
 class State(TypedDict, total=False):
     user_input: str
     route: Literal["people", "asset", "faq", "rag", "action"]
-    approved: bool
     draft: Dict[str, Any]
+    approved: bool
     result: str
 
 
 # =========================================================
-# Agent-level nodes (each node calls an Agent)
+# 5) LangGraph nodes (each node calls an Agents SDK Agent)
 # =========================================================
 
 async def triage_node(state: State) -> State:
-    # TODO: real routing logic (LLM classify or rule)
-    state["route"] = "rag"
+    # TODO: in production, parse the triage output strictly
+    res = await Runner.run(triage_agent, state["user_input"])
+    route = (res.final_output or "").strip()
+
+    # Safe fallback (keep deterministic for skeleton)
+    if route not in {"people", "asset", "faq", "rag", "action"}:
+        route = "rag"
+
+    state["route"] = route  # type: ignore
     return state
 
 
 async def people_node(state: State) -> State:
-    resp = await people_agent.ainvoke(
-        {"messages": [{"role": "user", "content": state["user_input"]}]}
-    )
-    state["result"] = resp["messages"][-1].content
+    res = await Runner.run(people_agent, state["user_input"])
+    state["result"] = res.final_output
     return state
 
 
 async def asset_node(state: State) -> State:
-    resp = await asset_agent.ainvoke(
-        {"messages": [{"role": "user", "content": state["user_input"]}]}
-    )
-    state["result"] = resp["messages"][-1].content
+    res = await Runner.run(asset_agent, state["user_input"])
+    state["result"] = res.final_output
     return state
 
 
 async def faq_node(state: State) -> State:
-    resp = await faq_agent.ainvoke(
-        {"messages": [{"role": "user", "content": state["user_input"]}]}
-    )
-    state["result"] = resp["messages"][-1].content
+    res = await Runner.run(faq_agent, state["user_input"])
+    state["result"] = res.final_output
     return state
 
 
 async def rag_node(state: State) -> State:
-    resp = await rag_agent.ainvoke(
-        {"messages": [{"role": "user", "content": state["user_input"]}]}
-    )
-    state["result"] = resp["messages"][-1].content
+    res = await Runner.run(rag_agent, state["user_input"])
+    state["result"] = res.final_output
     return state
 
 
 async def action_node(state: State) -> State:
-    _ = await action_agent.ainvoke(
-        {"messages": [{"role": "user", "content": state["user_input"]}]}
-    )
+    # Draft generation only
+    _ = await Runner.run(action_agent, state["user_input"])
+    # TODO: structured draft output (pydantic output_type, JSON schema, etc.)
     state["draft"] = {"type": "jira", "payload": {"summary": "<TODO>", "description": "<TODO>"}}
     state["approved"] = False
-    state["result"] = "Draft created. Approval required before MCP execution."
+    state["result"] = "Draft created. Needs guardrail/approval before MCP execution."
     return state
 
 
 async def guardrail_node(state: State) -> State:
-    _ = await guardrail_agent.ainvoke(
-        {"messages": [{"role": "user", "content": "Guardrail check for draft (TODO)."}]}
-    )
-    # TODO: replace with real approval gate
+    # TODO: have guardrail_agent produce an explicit allow/deny decision
+    _ = await Runner.run(guardrail_agent, "Review draft: <TODO>")
+    # Skeleton: auto-approve (replace with real human approval)
     state["approved"] = True
     return state
 
@@ -179,14 +202,10 @@ async def mcp_execute_node(state: State) -> State:
         state["result"] = "Approval required. Execution skipped."
         return state
 
-    if mcp_exec_agent is None:
-        state["result"] = "MCP not initialized. Execution skipped."
-        return state
-
-    resp = await mcp_exec_agent.ainvoke(
-        {"messages": [{"role": "user", "content": "Execute draft via MCP (TODO)."}]}
-    )
-    state["result"] = resp["messages"][-1].content
+    # MCP execution happens via MCP-enabled agent
+    # TODO: craft a message instructing which MCP tool to call + args from state["draft"]
+    res = await Runner.run(mcp_executor_agent, "Execute draft via MCP: <TODO>")
+    state["result"] = res.final_output
     return state
 
 
@@ -195,7 +214,7 @@ def route_after_triage(state: State) -> str:
 
 
 # =========================================================
-# Build Graph
+# 6) Build LangGraph (Agent-to-Agent flow)
 # =========================================================
 
 def build_graph():
@@ -206,7 +225,6 @@ def build_graph():
     g.add_node("asset", asset_node)
     g.add_node("faq", faq_node)
     g.add_node("rag", rag_node)
-
     g.add_node("action", action_node)
     g.add_node("guardrail", guardrail_node)
     g.add_node("mcp_execute", mcp_execute_node)
@@ -238,13 +256,11 @@ def build_graph():
 
 
 # =========================================================
-# Runner
+# 7) Runner
 # =========================================================
 
 async def main():
-    await init_mcp()
     app = build_graph()
-
     out = await app.ainvoke({"user_input": "회식비 처리 절차 알려줘"})
     print(out.get("result", ""))
 
