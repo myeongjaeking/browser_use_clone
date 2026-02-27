@@ -1,103 +1,125 @@
 """
-SPLX-detectable: Orchestrator Pattern + LangGraph (single file)
-- Orchestrator Agent: Central router/caller
-- Sub-agents as tools
-- MCP integration preserved
+SPLX-detectable: Pure Agent-to-Agent Orchestration (single file)
+- Orchestrator calls sub-agents as tools
+- Direct Agent objects in function_tools
 """
 
 import os
 import asyncio
-from typing import TypedDict, Dict, Any, Annotated, Literal
+from typing import TypedDict, Literal, Annotated
 from langgraph.graph import StateGraph, END
 
-# OpenAI Agents SDK
 from agents import Agent, Runner, function_tool
 from agents.mcp.server import MCPServerStdio, MCPServerStdioParams
 
 # =========================================================
-# 1) Sub-Agent Tools (Orchestrator가 호출)
+# 1) Sub-Agents (독립 Agent 객체)
 # =========================================================
-@function_tool
-async def knowledge_tool(query: str) -> str:
-    """사내 지식 조회 (People/Asset/FAQ)."""
-    agent = Agent(
-        name="Knowledge",
-        instructions="people/asset/faq 도구로 사내 조회.",
-        tools=[people_lookup, asset_lookup, faq_search],  # 기존 도구들
-    )
-    res = await Runner.run(agent, query)
-    return res.final_output or "조회 실패"
+knowledge_agent = Agent(
+    name="Knowledge Agent",
+    instructions="사원/자산/FAQ 조회.",
+    tools=[people_lookup, asset_lookup, faq_search],
+)
 
-@function_tool
-async def rag_tool(query: str) -> str:
-    """RAG 문서 검색."""
-    agent = Agent(
-        name="RAG",
-        instructions="rag_retrieve로 문서 기반 답변.",
-        tools=[rag_retrieve],
-    )
-    res = await Runner.run(agent, query)
-    return res.final_output or "RAG 실패"
+rag_agent = Agent(
+    name="RAG Agent",
+    instructions="문서 검색/답변.",
+    tools=[rag_retrieve],
+)
 
-# 기존 도구들 (knowledge_tool 내부 사용)
-@function_tool
-def people_lookup(name: str) -> str: return "<TODO>"
-@function_tool
-def asset_lookup(item: str) -> str: return "<TODO>"
-@function_tool
-def faq_search(query: str) -> str: return "<TODO>"
-@function_tool
-def rag_retrieve(query: str) -> str: return "<TODO>"
+mcp_agent = Agent(
+    name="MCP Agent",
+    instructions="Atlassian MCP 실행 (Jira/Confluence).",
+    mcp_servers=[ATLASSIAN_MCP_SERVER],
+)
+
+# 기존 도구들 (생략: 이전과 동일)
+@function_tool def people_lookup(name: str) -> str: return "<TODO>"
+@function_tool def asset_lookup(item: str) -> str: return "<TODO>"
+@function_tool def faq_search(query: str) -> str: return "<TODO>"
+@function_tool def rag_retrieve(query: str) -> str: return "<TODO>"
 
 # =========================================================
-# 2) MCP Server (unchanged)
+# 2) MCP Server
 # =========================================================
-ATLASSIAN_MCP_PARAMS: MCPServerStdioParams = { ... }  # 이전과 동일
+ATLASSIAN_MCP_PARAMS: MCPServerStdioParams = {
+    "command": "uvx", "args": ["mcp-atlassian"],
+    "env": { "JIRA_URL": os.getenv("JIRA_URL"), ... },  # 생략
+}
 ATLASSIAN_MCP_SERVER = MCPServerStdio(ATLASSIAN_MCP_PARAMS)
 
 # =========================================================
-# 3) Orchestrator Agent (중앙 오케스트레이터)
+# 3) Agent-as-Tool Functions (Orchestrator가 호출)
+# =========================================================
+@function_tool
+async def call_knowledge_agent(query: str) -> str:
+    """Knowledge Agent 호출."""
+    res = await Runner.run(knowledge_agent, query)
+    return res.final_output or "Knowledge 처리 실패"
+
+@function_tool
+async def call_rag_agent(query: str) -> str:
+    """RAG Agent 호출."""
+    res = await Runner.run(rag_agent, query)
+    return res.final_output or "RAG 처리 실패"
+
+@function_tool
+async def call_mcp_agent(command: str) -> str:
+    """MCP Agent 호출 (작업 명령)."""
+    res = await Runner.run(mcp_agent, command)
+    return res.final_output or "MCP 실행 실패"
+
+# =========================================================
+# 4) Orchestrator Agent (Sub-Agent 호출자)
 # =========================================================
 orchestrator_agent = Agent(
     name="Orchestrator Agent",
     instructions="""
-    사용자 쿼리 분석 후 적합한 sub-agent 호출:
-    - knowledge_tool: 사원/자산/FAQ (e.g. "김팀장", "회의실", "회식비")
-    - rag_tool: 문서/보고서 (e.g. "최근 보고서")
-    - 직접 MCP: Atlassian 작업 (Jira/Confluence)
+    쿼리 분석 후 적합한 Agent 호출 (한 번에 하나, 또는 순차):
+    - call_knowledge_agent: 사원/자산/FAQ ("김팀장", "회의실", "회식비")
+    - call_rag_agent: 문서/보고서 ("Q1 실적 보고서")
+    - call_mcp_agent: Jira/Confluence 작업 ("Jira 티켓 생성: 회식비 정산")
     
-    결과를 합성해 최종 답변. 여러 tool 병렬 가능.
+    결과 합성 후 최종 답변. 필요시 여러 호출.
     """,
-    tools=[knowledge_tool, rag_tool],  # MCP는 직접 (또는 별도 tool)
-    mcp_servers=[ATLASSIAN_MCP_SERVER],
+    tools=[call_knowledge_agent, call_rag_agent, call_mcp_agent],
 )
 
 # =========================================================
-# 4) State
+# 5) State & Nodes
 # =========================================================
 class State(TypedDict):
     messages: Annotated[list, "add_messages"]
-    result: str
+    route: Literal["knowledge", "rag", "mcp"]
+    final_result: str
 
-# =========================================================
-# 5) Orchestrator Node (단일 노드!)
-# =========================================================
+async def router_node(state: State) -> State:
+    """Triage-like 라우팅 (Orchestrator 전처리)."""
+    query = state["messages"][-1].content.lower()
+    if any(kw in query for kw in ["사원", "팀", "자산", "위치", "faq", "절차"]):
+        state["route"] = "knowledge"
+    elif any(kw in query for kw in ["문서", "보고서", "파일"]):
+        state["route"] = "rag"
+    else:
+        state["route"] = "mcp"
+    return state
+
 async def orchestrator_node(state: State) -> State:
-    """Orchestrator가 모든 호출 처리."""
-    try:
-        res = await Runner.run(orchestrator_agent, state["messages"][-1].content)
-        state["result"] = res.final_output
-    except Exception as e:
-        state["result"] = f"오류: {str(e)}. 기본 처리: {state['messages'][-1].content}"
+    """Orchestrator 실행 + route 힌트."""
+    hint = f"Route 힌트: {state['route']}. 쿼리: {state['messages'][-1].content}"
+    res = await Runner.run(orchestrator_agent, hint)
+    state["final_result"] = res.final_output
     return state
 
 # =========================================================
-# 6) Simplified Graph (1 노드!)
+# 6) Graph (라우팅 → Orchestrator)
 # =========================================================
 def build_graph():
     g = StateGraph(State)
+    g.add_node("router", router_node)
     g.add_node("orchestrator", orchestrator_node)
-    g.set_entry_point("orchestrator")
+    g.set_entry_point("router")
+    g.add_edge("router", "orchestrator")
     g.add_edge("orchestrator", END)
     return g.compile()
 
@@ -106,12 +128,9 @@ def build_graph():
 # =========================================================
 async def main():
     app = build_graph()
-    config = {"configurable": {"thread_id": "1"}}  # 세션 유지
-    out = await app.ainvoke(
-        {"messages": [{"role": "user", "content": "회식비 처리 절차 알려줘"}]},
-        config
-    )
-    print(out["result"])
+    input_data = {"messages": [{"role": "user", "content": "회식비 처리 절차 알려줘"}]}
+    out = await app.ainvoke(input_data)
+    print("결과:", out["final_result"])
 
 if __name__ == "__main__":
     asyncio.run(main())
